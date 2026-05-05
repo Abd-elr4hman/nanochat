@@ -53,6 +53,7 @@ parser.add_argument("--mamba", action="store_true", help="use the Mamba backbone
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention (GPT only)")
+parser.add_argument("--d-head", type=int, default=64, help="Mamba SSM head dim; must satisfy (d_inner / d_head) %% 8 == 0 (Mamba only)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL') (GPT only)")
 # Training horizon (only one used, in order of precedence)
@@ -132,11 +133,16 @@ print0(f"Vocab size: {vocab_size:,}")
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     if args.mamba:
-        # Mamba path: width = depth * aspect_ratio (no head_dim rounding needed, no attention)
+        # Mamba path: width = depth * aspect_ratio (no head_dim rounding needed, no attention).
+        # causal_conv1d requires (d_inner / d_head) % 8 == 0, where d_inner = expand_factor * d_model = 2 * d_model.
         model_dim = depth * args.aspect_ratio
+        d_inner = 2 * model_dim
+        n_heads = d_inner // args.d_head
+        assert d_inner % args.d_head == 0, f"d_inner ({d_inner}) must be divisible by --d-head ({args.d_head})"
+        assert n_heads % 8 == 0, f"d_inner / d_head ({n_heads}) must be a multiple of 8 for causal_conv1d"
         config = MambaConfig(
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
-            n_layer=depth, n_embd=model_dim,
+            n_layer=depth, n_embd=model_dim, d_head=args.d_head,
         )
         with torch.device("meta"):
             model_meta = Mamba(config)
