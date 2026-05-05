@@ -50,4 +50,11 @@ uv pip install setuptools wheel
 
 MAX_JOBS="${MAX_JOBS:-1}" uv pip install "mamba-ssm[causal-conv1d]" --no-build-isolation
 
+# -----------------------------------------------------------------------------
+# mambapy: pure-Python Mamba implementation (PyPI 1.2.0 ships Mamba-2 wrapper).
+# Our nanochat/mamba.py imports from mambapy.mamba2, which in turn imports
+# mamba_ssm's Triton kernels — installed above.
+
+uv pip install mambapy
+
 echo "Setup complete!"
