@@ -1,17 +1,26 @@
 """
-Mamba model wrapper (mirrors gpt.py structure).
+Mamba-2 model wrapper (mirrors gpt.py structure).
 
-The backbone is mambapy.Mamba; this file provides:
+The backbone is mambapy.mamba2.Mamba2; this file provides:
 - token embedding (wte)
 - final norm + lm_head with softcap (matches gpt.py)
 - training/inference forward contract: (idx, targets) -> loss
-- setup_optimizer with AdamW groups
+- setup_optimizer with Muon + AdamW groups
 - init_weights, estimate_flops, num_scaling_params
 
 GPT-specific tricks are intentionally NOT carried over (rotary, sliding window,
 value embeddings, smear, backout, resid_lambdas/x0_lambdas, kv_cache). Mamba is
 its own opinionated block with its own internal residuals; the goal here is a
-clean Mamba baseline, not a Mamba-with-attention-tricks-bolted-on.
+clean Mamba-2 baseline, not a Mamba-with-attention-tricks-bolted-on.
+
+================================================================================
+HARD DEPENDENCY ON mamba_ssm
+================================================================================
+mambapy/mamba2.py top-level imports `mamba_ssm.ops.triton.ssd_combined`. There
+is NO pure-PyTorch fallback for Mamba-2; the Triton kernel
+(mamba_chunk_scan_combined / mamba_split_conv1d_scan_combined) IS the
+implementation. Importing this file therefore requires a working mamba_ssm
+install. On Windows that means running under WSL2 — see runs/setup_mamba.sh.
 
 ================================================================================
 COMPATIBILITY NOTES (for plugging into base_train.py)
@@ -26,47 +35,51 @@ COMPATIBILITY NOTES (for plugging into base_train.py)
 ================================================================================
 TODO / FOLLOW-UPS
 ================================================================================
-- Tri Dao SSM kernel: mambapy can call `mamba_ssm.ops.selective_scan_fn` if we
-  set `use_cuda=True`. Plumb `use_cuda` through MambaConfig later for H100
-  profiling. Caveats: kernel is fp32-only (no bf16/fp16); for bf16 we'd need
-  Mamba-2's Triton kernel (`mamba_ssm.ops.triton.ssd_combined`, different API).
-- Incremental decode: wire mambapy's `step()` for O(1) generation.
+- Incremental decode: wire mambapy's `step()` for O(1) generation. Mamba-2's
+  step() takes (h, conv_inputs) caches per layer.
 
 ================================================================================
 DESIGN DECISIONS LOG (revisit if results are off)
 ================================================================================
 
-1. OPTIMIZER SPLIT
+1. d_head = 64
+   Mamba-2 splits d_inner into n_heads of size d_head (analogous to
+   multi-head attention). Constraint from causal_conv1d:
+   (d_inner / d_head) % 8 == 0. With expand_factor=2, d_head=64, this is
+   satisfied for any d_model that is a multiple of 32 (which our scaling
+   rule width = depth * 64 always gives).
+
+2. OPTIMIZER SPLIT
    - 2D backbone params -> Muon (matrix optimizer)
-   - 1D backbone params (A_log, D, dt biases) -> AdamW
+   - Other-dim backbone params (A_log, D, dt biases, conv1d 3D weight) -> AdamW
    Rationale: mirrors gpt.py's logic of "matrices to Muon, scalars to AdamW."
    Risk: Muon was tuned for transformer matmul shapes; not obvious it transfers
-   cleanly to Mamba's different matrix shapes (input/output projections, conv,
-   dt projection). May need to fall back to AdamW for the whole backbone if
-   training is unstable.
+   cleanly to Mamba's projection shapes (in_proj, out_proj). May need to fall
+   back to AdamW for the whole backbone if training is unstable.
 
-2. WEIGHT INIT
+3. WEIGHT INIT
    - wte:     normal(0, 0.8)     <- matches gpt.py
    - lm_head: normal(0, 0.001)   <- matches gpt.py
    - backbone: left to mambapy's defaults (battle-tested SSM-specific inits
                for A_log, D, dt projection). Don't clobber these.
 
-3. FLOPS ESTIMATE
-   Used simple `6 * params/token`. For Mamba the GPT attention term
-   `12 * h * q * seq_len` is gone (Mamba is O(L), not O(L^2)). Embeddings
-   excluded because they're lookups, not matmuls.
+4. FLOPS ESTIMATE
+   Used simple `6 * params/token`. Mamba-2 is O(L), so unlike GPT we don't
+   have a seq-len-quadratic attention term. Embeddings excluded (lookups,
+   not matmuls).
 
-4. GENERATE
-   Naive: re-run full sequence each step. Mamba's killer feature is O(1)
-   incremental decoding via the `step()` API, but that's not wired up here.
+5. GENERATE
+   Naive: re-run full sequence each step. Mamba-2's killer feature is O(1)
+   incremental decoding via the step() API, but that's not wired up here.
    Fine for a training-time baseline; would matter for an inference benchmark.
 
-5. KV CACHE
+6. KV CACHE
    `forward` accepts `kv_cache` for interface compatibility with GPT but
-   ignores it. Mamba would use its own SSM state mechanism for incremental
-   decoding, but we don't need this for the training comparison.
+   ignores it. Mamba-2 would use its own (h, conv_inputs) state mechanism
+   for incremental decoding, but we don't need this for the training
+   comparison.
 
-6. DROPPED FEATURES (vs gpt.py)
+7. DROPPED FEATURES (vs gpt.py)
    - rotary embeddings (Mamba is inherently positional via its recurrence)
    - sliding window attention (no attention)
    - value embeddings, ve_gate (attention-specific)
@@ -87,8 +100,8 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-from mambapy.mamba import Mamba as MambaBackbone
-from mambapy.mamba import MambaConfig as MambaBackboneConfig
+from mambapy.mamba2 import Mamba2 as MambaBackbone
+from mambapy.mamba2 import Mamba2Config as MambaBackboneConfig
 
 
 @dataclass
@@ -97,8 +110,9 @@ class MambaConfig:
     vocab_size: int = 32768
     n_layer: int = 12
     n_embd: int = 768
-    # Mamba-specific
-    d_state: int = 16
+    # Mamba-2-specific
+    d_head: int = 64
+    d_state: int = 64
     d_conv: int = 4
     expand_factor: int = 2
 
@@ -131,10 +145,11 @@ class Mamba(nn.Module):
         # Token embedding
         self.wte = nn.Embedding(padded_vocab_size, config.n_embd)
 
-        # The Mamba backbone (mambapy expects its own config object)
+        # The Mamba-2 backbone (mambapy expects its own config object)
         backbone_config = MambaBackboneConfig(
             d_model=config.n_embd,
             n_layers=config.n_layer,
+            d_head=config.d_head,
             d_state=config.d_state,
             d_conv=config.d_conv,
             expand_factor=config.expand_factor,
@@ -165,7 +180,7 @@ class Mamba(nn.Module):
     def estimate_flops(self):
         """
         Approximate forward+backward FLOPs per token.
-        Mamba is O(L) in sequence length, so unlike GPT we don't have a
+        Mamba-2 is O(L) in sequence length, so unlike GPT we don't have a
         seq-len-quadratic attention term. We use the matmul approximation:
         every matmul param contributes ~6 FLOPs/token (2 fwd + 4 bwd).
         Embeddings are pure lookups, not counted.
@@ -196,16 +211,17 @@ class Mamba(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         """
         Same optimizer recipe as GPT: AdamW for embeddings + lm_head, Muon for
-        backbone matrix params. Mamba's internal scalars (dt biases, A_log, D)
-        are 1D and go into AdamW alongside the scalar group.
+        backbone matrix params. Mamba-2's internal scalars (dt biases, A_log, D)
+        and the 3D conv1d weight are non-2D and go into AdamW alongside the
+        scalar group.
         """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Split backbone params: strictly 2D matrices -> Muon; everything else -> AdamW.
         # NOTE: Muon's fused kernel assumes 2D weights. Mamba has a 3D conv1d weight
-        # (shape: (d_inner, 1, d_conv)) that would crash Muon. The conv is also tiny
-        # (~14K params total at d4) so AdamW is fine for it.
+        # (shape: (d_inner + 2*n_groups*d_state, 1, d_conv)) that would crash Muon.
+        # The conv is also tiny so AdamW is fine for it.
         matrix_params = [p for p in self.backbone.parameters() if p.ndim == 2]
         scalar_params = [p for p in self.backbone.parameters() if p.ndim != 2]
         embedding_params = [self.wte.weight]
@@ -243,7 +259,7 @@ class Mamba(nn.Module):
         x = x.to(COMPUTE_DTYPE)
         x = norm(x)
 
-        # Mamba backbone: (B, T, D) -> (B, T, D)
+        # Mamba-2 backbone: (B, T, D) -> (B, T, D)
         x = self.backbone(x)
         x = norm(x)
 
