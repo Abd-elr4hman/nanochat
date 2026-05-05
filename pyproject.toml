@@ -12,7 +12,7 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch==2.9.1",
+    "torch==2.4.1",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -35,11 +35,12 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# target torch to cuda 12.4 or CPU
+# (pinned to match the torch version mamba_ssm is built against)
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu128", extra = "gpu" },
+    { index = "pytorch-cu124", extra = "gpu" },
 ]
 
 [[tool.uv.index]]
@@ -48,17 +49,17 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [project.optional-dependencies]
 cpu = [
     "setuptools>=65.0.0",
-    "torch==2.9.1",
+    "torch==2.4.1",
 ]
 gpu = [
-    "torch==2.9.1",
+    "torch==2.4.1",
 ]
 
 [tool.uv]
