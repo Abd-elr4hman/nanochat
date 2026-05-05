@@ -57,4 +57,10 @@ MAX_JOBS="${MAX_JOBS:-1}" uv pip install "mamba-ssm[causal-conv1d]" --no-build-i
 
 uv pip install mambapy
 
-echo "Setup complete!"
+# -----------------------------------------------------------------------------
+# wandb: training-run logging. Run `wandb login` once after this script to
+# authenticate (writes to ~/.netrc, persists across sessions).
+
+uv pip install wandb
+
+echo "Setup complete! Run 'wandb login' once before training to enable run logging."
